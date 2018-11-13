@@ -1,121 +1,181 @@
-
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
-#include <stdio.h>
+#include <iostream>
+#include <fstream>
+#include <ctime>
 
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
+using namespace std;
 
-__global__ void addKernel(int *c, const int *a, const int *b)
+#define THREAD_NUM 256
+
+#define VEC_TOTAL 19545
+#define VEC_SIZE 2960
+#define NUM_CENTROID 10
+
+__global__ void mul(int n, float *vec, float *centroid, float *distances)
 {
-    int i = threadIdx.x;
-    c[i] = a[i] + b[i];
+	//int i_index = blockIdx.x;
+	//int i_stide = gridDim.x;
+	//int j_index = threadIdx.x;
+	//int j_stride = blockDim.x;
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	int stride = blockDim.x * gridDim.x;
+	for (int i = index; i < n; i += stride) {
+		int v_index = i / NUM_CENTROID;
+		int c_index = i % NUM_CENTROID;
+		distances[i] = 0;
+		float temp = 0;
+		for (int j = 0; j < VEC_SIZE; j++) {
+			temp = vec[v_index * VEC_SIZE + j] - centroid[c_index * VEC_SIZE + j];
+			distances[i] += temp * temp;
+		}
+	}
 }
 
-int main()
+__global__ void cluster(int n, int *indices, float *distances)
 {
-    const int arraySize = 5;
-    const int a[arraySize] = { 1, 2, 3, 4, 5 };
-    const int b[arraySize] = { 10, 20, 30, 40, 50 };
-    int c[arraySize] = { 0 };
-
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addWithCuda failed!");
-        return 1;
-    }
-
-    printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
-        c[0], c[1], c[2], c[3], c[4]);
-
-    // cudaDeviceReset must be called before exiting in order for profiling and
-    // tracing tools such as Nsight and Visual Profiler to show complete traces.
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-        return 1;
-    }
-
-    return 0;
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	int stride = blockDim.x * gridDim.x;
+	for (int i = index; i < n; i += stride) {
+		float min_distance = VEC_SIZE;
+		int min_index = -1;
+		for (int j = 0; j < NUM_CENTROID; j++) {
+			float temp = distances[i * NUM_CENTROID + j];
+			if (temp < min_distance) {
+				min_distance = temp;
+				min_index = j;
+			}
+		}
+		indices[i] = min_index;
+	}
 }
 
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
+__global__ void check_equal(int n, int *indices1, int *indices2, bool *equal)
 {
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	int stride = blockDim.x * gridDim.x;
+	for (int i = index; i < n; i += stride) {
+		if (indices1[i] != indices2[i]) {
+			*equal = false;
+		}
+	}
+}
 
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
-    }
+__global__ void clear_centroid(int n, float *centroid)
+{
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	int stride = blockDim.x * gridDim.x;
+	for (int i = index; i < n; i += stride) {
+		centroid[i] = 0;
+	}
+		
+}
 
-    // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+__global__ void add(int n, float *centroid, float *vec)
+{
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	int stride = blockDim.x * gridDim.x;
+	for (int i = index; i < n; i += stride) {
+		centroid[i] = centroid[i] + vec[i];
+	}
+}
 
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+__global__ void div(int n, float *centroid, int *centroid_count)
+{
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	int stride = blockDim.x * gridDim.x;
+	for (int i = index; i < n; i += stride) {
+		centroid[i] /= centroid_count[i / VEC_SIZE];
+	}
+}
 
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+int main(void)
+{
+	time_t start, end;
+	int count = 0;
+	bool active = true;
 
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+	float *vec, *centroid;
+	int *indices, *indices1, *indices2, *centroid_count;
+	bool *equal;
+	cudaMallocManaged(&vec, VEC_TOTAL * VEC_SIZE * sizeof(float));
+	cudaMallocManaged(&centroid, NUM_CENTROID * VEC_SIZE * sizeof(float));
+	cudaMallocManaged(&indices1, VEC_TOTAL * sizeof(int));
+	cudaMallocManaged(&indices2, VEC_TOTAL * sizeof(int));
+	cudaMallocManaged(&centroid_count, NUM_CENTROID * sizeof(int));
+	cudaMallocManaged(&equal, sizeof(bool));
+	
+	ifstream file;
+	file.open("vector.txt");
+	for (int i = 0; i < NUM_CENTROID; i++) {
+		for (int j = 0; j < VEC_SIZE; j++) {
+			file >> vec[i * VEC_SIZE + j];
+			centroid[i * VEC_SIZE + j] = vec[i * VEC_SIZE + j];
+		}
+		indices1[i] = 0;
+		indices2[i] = 0;
+	}
+	for (int i = NUM_CENTROID; i < VEC_TOTAL; i++) {
+		cout << i << endl;
+		for (int j = 0; j < VEC_SIZE; j++) {
+			file >> vec[i * VEC_SIZE + j];
+		}
+		indices1[i] = 0;
+		indices2[i] = 0;
+	}
+	file.close();
 
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+	time(&start);
+	while (true) {
+		cout << ++count << endl;
+		indices = active ? indices1 : indices2;
+		float *dist, *distances;
+		cudaMallocManaged(&distances, VEC_TOTAL * NUM_CENTROID * sizeof(float));
+		mul << <(VEC_TOTAL * NUM_CENTROID + THREAD_NUM - 1) / THREAD_NUM, THREAD_NUM >> >(VEC_TOTAL * NUM_CENTROID, vec, centroid, distances);
+		cudaDeviceSynchronize();
+		cluster << <(VEC_TOTAL + THREAD_NUM - 1) / THREAD_NUM, THREAD_NUM >> >(VEC_TOTAL, indices, distances);
+		cudaDeviceSynchronize();
+		//cout << distances[(VEC_TOTAL - 1) * NUM_CENTROID + NUM_CENTROID - 2] << endl;
+		//cout << indices1[9] << endl;
+		cudaFree(distances);
+		*equal = true;
+		check_equal << <(VEC_TOTAL + THREAD_NUM - 1) / THREAD_NUM, THREAD_NUM >> > (VEC_TOTAL, indices1, indices2, equal);
+		cudaDeviceSynchronize();
+		if (*equal) break;
 
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel<<<1, size>>>(dev_c, dev_a, dev_b);
+		clear_centroid << <(NUM_CENTROID * VEC_SIZE + THREAD_NUM - 1) / THREAD_NUM, THREAD_NUM >> > (NUM_CENTROID * VEC_SIZE, centroid);
+		cudaDeviceSynchronize();
+		for (int i = 0; i < NUM_CENTROID; i++) {
+			centroid_count[i] = 0;
+		}
+		/*for (int i = 0; i < VEC_TOTAL; i++) {
+			int index = indices[i];
+			centroid_count[index]++;
+			add << <(VEC_SIZE + THREAD_NUM - 1) / THREAD_NUM, THREAD_NUM >> >(VEC_SIZE, &centroid[index * VEC_SIZE], &vec[i * VEC_SIZE]);
+			cudaDeviceSynchronize();
+		}*/
+		for (int i = 0; i < VEC_TOTAL; i++) {
+			int index = indices[i];
+			centroid_count[index]++;
+			for (int j = 0; j < VEC_SIZE; j++) {
+				centroid[index * VEC_SIZE + j] += vec[i * VEC_SIZE + j];
+			}
+		}
+		div << <(NUM_CENTROID * VEC_SIZE + THREAD_NUM - 1) / THREAD_NUM, THREAD_NUM >> >(NUM_CENTROID * VEC_SIZE, centroid, centroid_count);
+		cudaDeviceSynchronize();
+		active = !active;
+		time(&end);
+		cout << "time: " << end - start << endl;
+	}
+	cout << centroid[0] << endl;
 
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
-    
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
+	cudaFree(vec);
+	cudaFree(centroid);
+	cudaFree(indices1);
+	cudaFree(indices2);
+	cudaFree(centroid_count);
+	cudaFree(equal);
 
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
-    cudaFree(dev_b);
-    
-    return cudaStatus;
+	return 0;
 }

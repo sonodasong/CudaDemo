@@ -1,0 +1,60 @@
+1
+time: 2
+2
+time: 2
+3
+time: 3
+4
+time: 4
+5
+time: 4
+6
+time: 5
+7
+time: 6
+8
+time: 6
+9
+time: 7
+10
+time: 8
+11
+time: 8
+12
+time: 9
+13
+time: 9
+14
+time: 10
+15
+time: 11
+16
+time: 11
+17
+time: 12
+18
+time: 13
+19
+time: 13
+20
+time: 14
+21
+time: 15
+22
+time: 15
+23
+time: 16
+24
+time: 17
+25
+time: 17
+26
+time: 18
+27
+time: 18
+28
+time: 19
+29
+time: 20
+30
+0.0409731
